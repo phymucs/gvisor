@@ -48,6 +48,7 @@ go_test(
     srcs = ["kernfs_test.go"],
     deps = [
         ":kernfs",
+        ":kernfstest",
         "//pkg/abi/linux",
         "//pkg/sentry/context",
         "//pkg/sentry/context/contexttest",
@@ -55,6 +56,22 @@ go_test(
         "//pkg/sentry/usermem",
         "//pkg/sentry/vfs",
         "//pkg/syserror",
+        "@com_github_google_go-cmp//cmp:go_default_library",
+    ],
+)
+
+go_library(
+    name = "kernfstest",
+    testonly = 1,
+    srcs = ["test_util.go"],
+    importpath = "gvisor.dev/gvisor/pkg/sentry/fsimpl/kernfstest",
+    visibility = ["//pkg/sentry:internal"],
+    deps = [
+        "//pkg/abi/linux",
+        "//pkg/sentry/context",
+        "//pkg/sentry/kernel/auth",
+        "//pkg/sentry/usermem",
+        "//pkg/sentry/vfs",
         "@com_github_google_go-cmp//cmp:go_default_library",
     ],
 )
