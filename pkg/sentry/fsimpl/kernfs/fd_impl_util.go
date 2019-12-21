@@ -43,11 +43,16 @@ type GenericDirectoryFD struct {
 }
 
 // Init initializes a GenericDirectoryFD.
-func (fd *GenericDirectoryFD) Init(m *vfs.Mount, d *vfs.Dentry, children *OrderedChildren, flags uint32) {
-	m.IncRef() // DecRef in vfs.FileDescription.vd.DecRef on final ref.
-	d.IncRef() // DecRef in vfs.FileDescription.vd.DecRef on final ref.
+func (fd *GenericDirectoryFD) Init(m *vfs.Mount, d *vfs.Dentry, children *OrderedChildren, flags uint32) error {
+	if vfs.AccessTypesForOpenFlags(flags)&vfs.MayWrite != 0 {
+		// Can't open directories writably.
+		return syserror.EISDIR
+	}
+	if err := fd.vfsfd.Init(fd, flags, m, d, &vfs.FileDescriptionOptions{}); err != nil {
+		return err
+	}
 	fd.children = children
-	fd.vfsfd.Init(fd, flags, m, d, &vfs.FileDescriptionOptions{})
+	return nil
 }
 
 // VFSFileDescription returns a pointer to the vfs.FileDescription representing

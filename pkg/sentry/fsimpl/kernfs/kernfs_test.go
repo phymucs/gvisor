@@ -59,7 +59,9 @@ func newTestSystem(t *testing.T, rootFn RootDentryFn) *TestSystem {
 	ctx := contexttest.Context(t)
 	creds := auth.CredentialsFromContext(ctx)
 	v := vfs.New()
-	v.MustRegisterFilesystemType("testfs", &fsType{rootFn: rootFn})
+	v.MustRegisterFilesystemType("testfs", &fsType{rootFn: rootFn}, &vfs.RegisterFilesystemTypeOptions{
+		AllowUserMount: true,
+	})
 	mns, err := v.NewMountNamespace(ctx, creds, "", "testfs", &vfs.GetFilesystemOptions{})
 	if err != nil {
 		t.Fatalf("Failed to create testfs root mount: %v", err)
@@ -106,7 +108,7 @@ func (s *TestSystem) ReadToEnd(fd *vfs.FileDescription) (string, error) {
 
 	var content bytes.Buffer
 	for {
-		n, err := fd.Impl().Read(s.ctx, bufIOSeq, opts)
+		n, err := fd.Read(s.ctx, bufIOSeq, opts)
 		if n == 0 || err != nil {
 			if err == io.EOF {
 				err = nil
@@ -176,7 +178,9 @@ func (fs *filesystem) newReadonlyDir(creds *auth.Credentials, mode linux.FileMod
 
 func (d *readonlyDir) Open(rp *vfs.ResolvingPath, vfsd *vfs.Dentry, flags uint32) (*vfs.FileDescription, error) {
 	fd := &kernfs.GenericDirectoryFD{}
-	fd.Init(rp.Mount(), vfsd, &d.OrderedChildren, flags)
+	if err := fd.Init(rp.Mount(), vfsd, &d.OrderedChildren, flags); err != nil {
+		return nil, err
+	}
 	return fd.VFSFileDescription(), nil
 }
 
@@ -283,7 +287,9 @@ func TestReadStaticFile(t *testing.T) {
 	})
 
 	pop := sys.PathOpAtRoot("file1")
-	fd, err := sys.vfs.OpenAt(sys.ctx, sys.creds, &pop, &vfs.OpenOptions{})
+	fd, err := sys.vfs.OpenAt(sys.ctx, sys.creds, &pop, &vfs.OpenOptions{
+		Flags: linux.O_RDONLY,
+	})
 	if err != nil {
 		sys.t.Fatalf("OpenAt for PathOperation %+v failed: %v", pop, err)
 	}
@@ -315,7 +321,9 @@ func TestCreateNewFileInStaticDir(t *testing.T) {
 	// Close the file. The file should persist.
 	fd.DecRef()
 
-	fd, err = sys.vfs.OpenAt(sys.ctx, sys.creds, &pop, &vfs.OpenOptions{})
+	fd, err = sys.vfs.OpenAt(sys.ctx, sys.creds, &pop, &vfs.OpenOptions{
+		Flags: linux.O_RDONLY,
+	})
 	if err != nil {
 		sys.t.Fatalf("OpenAt(pop:%+v) = %+v failed: %v", pop, fd, err)
 	}
@@ -363,24 +371,42 @@ func (d *direntCollector) contains(name string, typ uint8) error {
 	return nil
 }
 
-func TestDirFDReadWrite(t *testing.T) {
+func TestDirFDRead(t *testing.T) {
 	sys := newTestSystem(t, func(creds *auth.Credentials, fs *filesystem) *kernfs.Dentry {
 		return fs.newReadonlyDir(creds, 0755, nil)
 	})
 
 	pop := sys.PathOpAtRoot("/")
-	fd, err := sys.vfs.OpenAt(sys.ctx, sys.creds, &pop, &vfs.OpenOptions{})
+	fd, err := sys.vfs.OpenAt(sys.ctx, sys.creds, &pop, &vfs.OpenOptions{
+		Flags: linux.O_RDONLY,
+	})
 	if err != nil {
 		sys.t.Fatalf("OpenAt for PathOperation %+v failed: %v", pop, err)
 	}
 	defer fd.DecRef()
 
-	// Read/Write should fail for directory FDs.
+	// Read should fail for directory FDs.
 	if _, err := fd.Read(sys.ctx, usermem.BytesIOSequence([]byte{}), vfs.ReadOptions{}); err != syserror.EISDIR {
 		sys.t.Fatalf("Read for directory FD failed with unexpected error: %v", err)
 	}
-	if _, err := fd.Write(sys.ctx, usermem.BytesIOSequence([]byte{}), vfs.WriteOptions{}); err != syserror.EISDIR {
-		sys.t.Fatalf("Wrire for directory FD failed with unexpected error: %v", err)
+}
+
+func TestDirFDWrite(t *testing.T) {
+	sys := newTestSystem(t, func(creds *auth.Credentials, fs *filesystem) *kernfs.Dentry {
+		return fs.newReadonlyDir(creds, 0755, nil)
+	})
+
+	pop := sys.PathOpAtRoot("/")
+	fd, err := sys.vfs.OpenAt(sys.ctx, sys.creds, &pop, &vfs.OpenOptions{
+		Flags: linux.O_RDWR,
+	})
+	// Opening directories for writing should be disallowed.
+	if err != syserror.EISDIR {
+		if fd != nil {
+			fd.DecRef()
+			sys.t.Fatalf("OpenAt for PathOperation %+v succeeded, wanted EISDIR", pop)
+		}
+		sys.t.Fatalf("OpenAt for PathOperation %+v failed with wrong error: %v, wanted EISDIR", pop, err)
 	}
 }
 

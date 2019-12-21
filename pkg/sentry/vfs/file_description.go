@@ -49,7 +49,22 @@ type FileDescription struct {
 	// A reference is held on vd. vd is immutable.
 	vd VirtualDentry
 
+	// opts contains options passed to FileDescription.Init(). opts is
+	// immutable.
 	opts FileDescriptionOptions
+
+	// readable is MayReadFileWithOpenFlags(statusFlags). readable is
+	// immutable.
+	//
+	// readable is analogous to Linux's FMODE_READ.
+	readable bool
+
+	// writable is MayWriteFileWithOpenFlags(statusFlags). If writable is true,
+	// the FileDescription holds a write count on vd.mount. writable is
+	// immutable.
+	//
+	// writable is analogous to Linux's FMODE_WRITE.
+	writable bool
 
 	// impl is the FileDescriptionImpl associated with this Filesystem. impl is
 	// immutable. This should be the last field in FileDescription.
@@ -61,20 +76,45 @@ type FileDescriptionOptions struct {
 	// If AllowDirectIO is true, allow O_DIRECT to be set on the file. This is
 	// usually only the case if O_DIRECT would actually have an effect.
 	AllowDirectIO bool
+
+	// If UseDentryMetadata is true, calls to FileDescription methods that
+	// interact with file and filesystem metadata (Stat, SetStat, StatFS,
+	// Listxattr, Getxattr, Setxattr, Removexattr) are implemented by calling
+	// the corresponding FilesystemImpl methods instead of the corresponding
+	// FileDescriptionImpl methods.
+	//
+	// UseDentryMetadata is intended for file descriptions that are implemented
+	// outside of individual filesystems, such as pipes, sockets, and device
+	// special files. FileDescriptions for which UseDentryMetadata is true may
+	// embed DentryMetadataFileDescriptionImpl to obtain appropriate
+	// implementations of FileDescriptionImpl methods that should not be
+	// called.
+	UseDentryMetadata bool
 }
 
-// Init must be called before first use of fd. It takes ownership of references
-// on mnt and d held by the caller. statusFlags is the initial file description
-// status flags, which is usually the full set of flags passed to open(2).
-func (fd *FileDescription) Init(impl FileDescriptionImpl, statusFlags uint32, mnt *Mount, d *Dentry, opts *FileDescriptionOptions) {
+// Init must be called before first use of fd. It takes references on mnt and
+// d. statusFlags is the initial file description status flags, which is
+// usually the full set of flags passed to open(2).
+func (fd *FileDescription) Init(impl FileDescriptionImpl, statusFlags uint32, mnt *Mount, d *Dentry, opts *FileDescriptionOptions) error {
+	writable := MayWriteFileWithOpenFlags(statusFlags)
+	if writable {
+		if err := mnt.CheckBeginWrite(); err != nil {
+			return err
+		}
+	}
+
 	fd.refs = 1
 	fd.statusFlags = statusFlags | linux.O_LARGEFILE
 	fd.vd = VirtualDentry{
 		mount:  mnt,
 		dentry: d,
 	}
+	fd.vd.IncRef()
 	fd.opts = *opts
+	fd.readable = MayReadFileWithOpenFlags(statusFlags)
+	fd.writable = writable
 	fd.impl = impl
+	return nil
 }
 
 // IncRef increments fd's reference count.
@@ -140,7 +180,7 @@ func (fd *FileDescription) SetStatusFlags(ctx context.Context, creds *auth.Crede
 	// sense. However, the check as actually implemented seems to be "O_APPEND
 	// cannot be changed if the file is marked as append-only".
 	if (flags^oldFlags)&linux.O_APPEND != 0 {
-		stat, err := fd.impl.Stat(ctx, StatOptions{
+		stat, err := fd.Stat(ctx, StatOptions{
 			// There is no mask bit for stx_attributes.
 			Mask: 0,
 			// Linux just reads inode::i_flags directly.
@@ -154,7 +194,7 @@ func (fd *FileDescription) SetStatusFlags(ctx context.Context, creds *auth.Crede
 		}
 	}
 	if (flags&linux.O_NOATIME != 0) && (oldFlags&linux.O_NOATIME == 0) {
-		stat, err := fd.impl.Stat(ctx, StatOptions{
+		stat, err := fd.Stat(ctx, StatOptions{
 			Mask: linux.STATX_UID,
 			// Linux's inode_owner_or_capable() just reads inode::i_uid
 			// directly.
@@ -177,6 +217,16 @@ func (fd *FileDescription) SetStatusFlags(ctx context.Context, creds *auth.Crede
 	const settableFlags = linux.O_APPEND | linux.O_ASYNC | linux.O_DIRECT | linux.O_NOATIME | linux.O_NONBLOCK
 	atomic.StoreUint32(&fd.statusFlags, (oldFlags&^settableFlags)|(flags&settableFlags))
 	return nil
+}
+
+// IsReadable returns true if fd was opened for reading.
+func (fd *FileDescription) IsReadable() bool {
+	return fd.readable
+}
+
+// IsWritable returns true if fd was opened for writing.
+func (fd *FileDescription) IsWritable() bool {
+	return fd.writable
 }
 
 // Impl returns the FileDescriptionImpl associated with fd.
@@ -226,6 +276,8 @@ type FileDescriptionImpl interface {
 	// Errors:
 	//
 	// - If opts.Flags specifies unsupported options, PRead returns EOPNOTSUPP.
+	//
+	// Preconditions: The FileDescription was opened for reading.
 	PRead(ctx context.Context, dst usermem.IOSequence, offset int64, opts ReadOptions) (int64, error)
 
 	// Read is similar to PRead, but does not specify an offset.
@@ -239,6 +291,8 @@ type FileDescriptionImpl interface {
 	// Errors:
 	//
 	// - If opts.Flags specifies unsupported options, Read returns EOPNOTSUPP.
+	//
+	// Preconditions: The FileDescription was opened for reading.
 	Read(ctx context.Context, dst usermem.IOSequence, opts ReadOptions) (int64, error)
 
 	// PWrite writes src to the file, starting at the given offset, and returns
@@ -253,6 +307,8 @@ type FileDescriptionImpl interface {
 	//
 	// - If opts.Flags specifies unsupported options, PWrite returns
 	// EOPNOTSUPP.
+	//
+	// Preconditions: The FileDescription was opened for writing.
 	PWrite(ctx context.Context, src usermem.IOSequence, offset int64, opts WriteOptions) (int64, error)
 
 	// Write is similar to PWrite, but does not specify an offset, which is
@@ -266,6 +322,8 @@ type FileDescriptionImpl interface {
 	// Errors:
 	//
 	// - If opts.Flags specifies unsupported options, Write returns EOPNOTSUPP.
+	//
+	// Preconditions: The FileDescription was opened for writing.
 	Write(ctx context.Context, src usermem.IOSequence, opts WriteOptions) (int64, error)
 
 	// IterDirents invokes cb on each entry in the directory represented by the
@@ -348,17 +406,47 @@ func (fd *FileDescription) OnClose(ctx context.Context) error {
 
 // Stat returns metadata for the file represented by fd.
 func (fd *FileDescription) Stat(ctx context.Context, opts StatOptions) (linux.Statx, error) {
+	if fd.opts.UseDentryMetadata {
+		vfsObj := fd.vd.mount.vfs
+		rp := vfsObj.getResolvingPath(auth.CredentialsFromContext(ctx), &PathOperation{
+			Root:  fd.vd,
+			Start: fd.vd,
+		})
+		stat, err := fd.vd.mount.fs.impl.StatAt(ctx, rp, opts)
+		vfsObj.putResolvingPath(rp)
+		return stat, err
+	}
 	return fd.impl.Stat(ctx, opts)
 }
 
 // SetStat updates metadata for the file represented by fd.
 func (fd *FileDescription) SetStat(ctx context.Context, opts SetStatOptions) error {
+	if fd.opts.UseDentryMetadata {
+		vfsObj := fd.vd.mount.vfs
+		rp := vfsObj.getResolvingPath(auth.CredentialsFromContext(ctx), &PathOperation{
+			Root:  fd.vd,
+			Start: fd.vd,
+		})
+		err := fd.vd.mount.fs.impl.SetStatAt(ctx, rp, opts)
+		vfsObj.putResolvingPath(rp)
+		return err
+	}
 	return fd.impl.SetStat(ctx, opts)
 }
 
 // StatFS returns metadata for the filesystem containing the file represented
 // by fd.
 func (fd *FileDescription) StatFS(ctx context.Context) (linux.Statfs, error) {
+	if fd.opts.UseDentryMetadata {
+		vfsObj := fd.vd.mount.vfs
+		rp := vfsObj.getResolvingPath(auth.CredentialsFromContext(ctx), &PathOperation{
+			Root:  fd.vd,
+			Start: fd.vd,
+		})
+		statfs, err := fd.vd.mount.fs.impl.StatFSAt(ctx, rp)
+		vfsObj.putResolvingPath(rp)
+		return statfs, err
+	}
 	return fd.impl.StatFS(ctx)
 }
 
@@ -366,11 +454,17 @@ func (fd *FileDescription) StatFS(ctx context.Context) (linux.Statfs, error) {
 // offset, and returns the number of bytes read. PRead is permitted to return
 // partial reads with a nil error.
 func (fd *FileDescription) PRead(ctx context.Context, dst usermem.IOSequence, offset int64, opts ReadOptions) (int64, error) {
+	if !fd.readable {
+		return 0, syserror.EBADF
+	}
 	return fd.impl.PRead(ctx, dst, offset, opts)
 }
 
 // Read is similar to PRead, but does not specify an offset.
 func (fd *FileDescription) Read(ctx context.Context, dst usermem.IOSequence, opts ReadOptions) (int64, error) {
+	if !fd.readable {
+		return 0, syserror.EBADF
+	}
 	return fd.impl.Read(ctx, dst, opts)
 }
 
@@ -378,11 +472,17 @@ func (fd *FileDescription) Read(ctx context.Context, dst usermem.IOSequence, opt
 // offset, and returns the number of bytes written. PWrite is permitted to
 // return partial writes with a nil error.
 func (fd *FileDescription) PWrite(ctx context.Context, src usermem.IOSequence, offset int64, opts WriteOptions) (int64, error) {
+	if !fd.writable {
+		return 0, syserror.EBADF
+	}
 	return fd.impl.PWrite(ctx, src, offset, opts)
 }
 
 // Write is similar to PWrite, but does not specify an offset.
 func (fd *FileDescription) Write(ctx context.Context, src usermem.IOSequence, opts WriteOptions) (int64, error) {
+	if !fd.writable {
+		return 0, syserror.EBADF
+	}
 	return fd.impl.Write(ctx, src, opts)
 }
 
@@ -417,6 +517,16 @@ func (fd *FileDescription) Ioctl(ctx context.Context, uio usermem.IO, args arch.
 // Listxattr returns all extended attribute names for the file represented by
 // fd.
 func (fd *FileDescription) Listxattr(ctx context.Context) ([]string, error) {
+	if fd.opts.UseDentryMetadata {
+		vfsObj := fd.vd.mount.vfs
+		rp := vfsObj.getResolvingPath(auth.CredentialsFromContext(ctx), &PathOperation{
+			Root:  fd.vd,
+			Start: fd.vd,
+		})
+		names, err := fd.vd.mount.fs.impl.ListxattrAt(ctx, rp)
+		vfsObj.putResolvingPath(rp)
+		return names, err
+	}
 	names, err := fd.impl.Listxattr(ctx)
 	if err == syserror.ENOTSUP {
 		// Linux doesn't actually return ENOTSUP in this case; instead,
@@ -431,18 +541,48 @@ func (fd *FileDescription) Listxattr(ctx context.Context) ([]string, error) {
 // Getxattr returns the value associated with the given extended attribute for
 // the file represented by fd.
 func (fd *FileDescription) Getxattr(ctx context.Context, name string) (string, error) {
+	if fd.opts.UseDentryMetadata {
+		vfsObj := fd.vd.mount.vfs
+		rp := vfsObj.getResolvingPath(auth.CredentialsFromContext(ctx), &PathOperation{
+			Root:  fd.vd,
+			Start: fd.vd,
+		})
+		val, err := fd.vd.mount.fs.impl.GetxattrAt(ctx, rp, name)
+		vfsObj.putResolvingPath(rp)
+		return val, err
+	}
 	return fd.impl.Getxattr(ctx, name)
 }
 
 // Setxattr changes the value associated with the given extended attribute for
 // the file represented by fd.
 func (fd *FileDescription) Setxattr(ctx context.Context, opts SetxattrOptions) error {
+	if fd.opts.UseDentryMetadata {
+		vfsObj := fd.vd.mount.vfs
+		rp := vfsObj.getResolvingPath(auth.CredentialsFromContext(ctx), &PathOperation{
+			Root:  fd.vd,
+			Start: fd.vd,
+		})
+		err := fd.vd.mount.fs.impl.SetxattrAt(ctx, rp, opts)
+		vfsObj.putResolvingPath(rp)
+		return err
+	}
 	return fd.impl.Setxattr(ctx, opts)
 }
 
 // Removexattr removes the given extended attribute from the file represented
 // by fd.
 func (fd *FileDescription) Removexattr(ctx context.Context, name string) error {
+	if fd.opts.UseDentryMetadata {
+		vfsObj := fd.vd.mount.vfs
+		rp := vfsObj.getResolvingPath(auth.CredentialsFromContext(ctx), &PathOperation{
+			Root:  fd.vd,
+			Start: fd.vd,
+		})
+		err := fd.vd.mount.fs.impl.RemovexattrAt(ctx, rp, name)
+		vfsObj.putResolvingPath(rp)
+		return err
+	}
 	return fd.impl.Removexattr(ctx, name)
 }
 
@@ -464,7 +604,7 @@ func (fd *FileDescription) MappedName(ctx context.Context) string {
 
 // DeviceID implements memmap.MappingIdentity.DeviceID.
 func (fd *FileDescription) DeviceID() uint64 {
-	stat, err := fd.impl.Stat(context.Background(), StatOptions{
+	stat, err := fd.Stat(context.Background(), StatOptions{
 		// There is no STATX_DEV; we assume that Stat will return it if it's
 		// available regardless of mask.
 		Mask: 0,
@@ -480,7 +620,7 @@ func (fd *FileDescription) DeviceID() uint64 {
 
 // InodeID implements memmap.MappingIdentity.InodeID.
 func (fd *FileDescription) InodeID() uint64 {
-	stat, err := fd.impl.Stat(context.Background(), StatOptions{
+	stat, err := fd.Stat(context.Background(), StatOptions{
 		Mask: linux.STATX_INO,
 		// fs/proc/task_mmu.c:show_map_vma() just reads inode::i_ino directly.
 		Sync: linux.AT_STATX_DONT_SYNC,
@@ -493,5 +633,5 @@ func (fd *FileDescription) InodeID() uint64 {
 
 // Msync implements memmap.MappingIdentity.Msync.
 func (fd *FileDescription) Msync(ctx context.Context, mr memmap.MappableRange) error {
-	return fd.impl.Sync(ctx)
+	return fd.Sync(ctx)
 }
