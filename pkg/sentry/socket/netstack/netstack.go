@@ -1251,6 +1251,18 @@ func getSockOptTCP(t *kernel.Task, ep commonEndpoint, name, outLen int) (interfa
 
 		return int32(time.Duration(v) / time.Second), nil
 
+	case linux.TCP_DEFER_ACCEPT:
+		if outLen < sizeOfInt32 {
+			return nil, syserr.ErrInvalidArgument
+		}
+
+		var v tcpip.TCPDeferAcceptOption
+		if err := ep.GetSockOpt(&v); err != nil {
+			return nil, syserr.TranslateNetstackError(err)
+		}
+
+		return int32(time.Duration(v) / time.Second), nil
+
 	default:
 		emitUnimplementedEventTCP(t, name)
 	}
@@ -1703,6 +1715,16 @@ func setSockOptTCP(t *kernel.Task, ep commonEndpoint, name int, optVal []byte) *
 
 		v := usermem.ByteOrder.Uint32(optVal)
 		return syserr.TranslateNetstackError(ep.SetSockOpt(tcpip.TCPLingerTimeoutOption(time.Second * time.Duration(v))))
+
+	case linux.TCP_DEFER_ACCEPT:
+		if len(optVal) < sizeOfInt32 {
+			return syserr.ErrInvalidArgument
+		}
+		v := int32(usermem.ByteOrder.Uint32(optVal))
+		if v < 0 {
+			v = 0
+		}
+		return syserr.TranslateNetstackError(ep.SetSockOpt(tcpip.TCPDeferAcceptOption(time.Second * time.Duration(v))))
 
 	case linux.TCP_REPAIR_OPTIONS:
 		t.Kernel().EmitUnimplementedEvent(t)
@@ -2184,7 +2206,9 @@ func (s *SocketOperations) GetPeerName(t *kernel.Task) (linux.SockAddr, uint32, 
 		return nil, 0, syserr.TranslateNetstackError(err)
 	}
 
+	log.Infof("s.family: %s, remote: %s", s.family, addr)
 	a, l := ConvertAddress(s.family, addr)
+	log.Infof("a : %+v, l: %d", a, l)
 	return a, l, nil
 }
 
