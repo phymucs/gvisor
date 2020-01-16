@@ -413,9 +413,24 @@ func TestConnectResetAfterClose(t *testing.T) {
 	ep := c.EP
 	c.EP = nil
 
+	if got := c.Stack().Stats().TCP.CurrentEstablished.Value(); got != 1 {
+		t.Errorf("got stats.TCP.CurrentEstablished.Value() = %v, want = 1", got)
+	}
+	if got := c.Stack().Stats().TCP.CurrentOpen.Value(); got != 1 {
+		t.Errorf("got stats.TCP.CurrentEstablished.Value() = %v, want = 1", got)
+	}
+
 	// Close the endpoint, make sure we get a FIN segment, then acknowledge
 	// to complete closure of sender, but don't send our own FIN.
 	ep.Close()
+
+	if got := c.Stack().Stats().TCP.CurrentEstablished.Value(); got != 0 {
+		t.Errorf("got stats.TCP.CurrentEstablished.Value() = %v, want = 0", got)
+	}
+	if got := c.Stack().Stats().TCP.CurrentOpen.Value(); got != 1 {
+		t.Errorf("got stats.TCP.CurrentEstablished.Value() = %v, want = 1", got)
+	}
+
 	checker.IPv4(t, c.GetPacket(),
 		checker.TCP(
 			checker.DstPort(context.TestPort),
