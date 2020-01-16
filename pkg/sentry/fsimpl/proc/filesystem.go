@@ -47,7 +47,12 @@ func (ft *procFSType) GetFilesystem(ctx context.Context, vfsObj *vfs.VirtualFile
 	procfs := &kernfs.Filesystem{}
 	procfs.VFSFilesystem().Init(vfsObj, procfs)
 
-	_, dentry := newTasksInode(procfs, k, pidns)
+	var cgroups map[string]string
+	if opts.InternalData != nil {
+		cgroups = opts.InternalData.(map[string]string)
+	}
+
+	_, dentry := newTasksInode(procfs, k, pidns, cgroups)
 	return procfs.VFSFilesystem(), dentry.VFSDentry(), nil
 }
 
@@ -66,4 +71,15 @@ func newDentry(creds *auth.Credentials, ino uint64, perm linux.FileMode, inode d
 	d := &kernfs.Dentry{}
 	d.Init(inode)
 	return d
+}
+
+type staticFile struct {
+	kernfs.DynamicBytesFile
+	vfs.StaticData
+}
+
+var _ dynamicInode = (*staticFile)(nil)
+
+func newStaticFile(data string) *staticFile {
+	return &staticFile{StaticData: vfs.StaticData{Data: data}}
 }
